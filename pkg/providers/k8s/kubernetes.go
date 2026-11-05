@@ -1,0 +1,167 @@
+package k8s
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+
+	"github.com/projectdiscovery/cloudlist/pkg/schema"
+	"github.com/projectdiscovery/utils/errkit"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+)
+
+var Services = []string{"service", "ingress"}
+
+// Provider is a data provider for gcp API
+type Provider struct {
+	id               string
+	clientSet        *kubernetes.Clientset
+	services         schema.ServiceMap
+	extendedMetadata bool
+}
+
+const (
+	kubeconfig_file      = "kubeconfig_file"
+	encodedKubeConfig    = "kubeconfig_encoded"
+	useDefaultKubeconfig = "use_default_kubeconfig"
+	providerName         = "kubernetes"
+)
+
+func New(options schema.OptionBlock) (*Provider, error) {
+	id, _ := options.GetMetadata("id")
+
+	configFile, fileOk := options.GetMetadata(kubeconfig_file)
+	configEncoded, strOk := options.GetMetadata(encodedKubeConfig)
+	// Falling back to the ambient kubeconfig must be explicit, otherwise an
+	// incomplete block silently enumerates whatever cluster the host can reach.
+	if useDefault, _ := options.GetMetadata(useDefaultKubeconfig); !fileOk && !strOk && useDefault != "true" {
+		return nil, errkit.New("no kubeconfig_file or kubeconfig_encoded provided, set use_default_kubeconfig to use the default kubeconfig")
+	}
+	context, _ := options.GetMetadata("context")
+
+	var kubeConfig *rest.Config
+	var err error
+	if strOk {
+		decodedConfig, err := base64.StdEncoding.DecodeString(configEncoded)
+		if err != nil {
+			return nil, errkit.Wrap(err, "could not decode kubeconfig")
+		}
+		kubeConfig, err = buildConfigFromStr(context, decodedConfig)
+		if err != nil {
+			return nil, errkit.Wrap(err, "could not build kubeconfig")
+		}
+	} else {
+		kubeConfig, err = buildConfigWithContext(context, configFile)
+		if err != nil {
+			return nil, errkit.Wrap(err, "could not build kubeconfig")
+		}
+	}
+
+	clientset, err := kubernetes.NewForConfig(kubeConfig)
+	if err != nil {
+		return nil, errkit.Wrap(err, "could not create kubernetes clientset")
+	}
+
+	services := options.ResolveServices(Services)
+	var providerExtendedMetadata bool
+	if extendedMetadata, ok := options.GetMetadata("extended_metadata"); ok {
+		providerExtendedMetadata = extendedMetadata == "true"
+	}
+	return &Provider{id: id, clientSet: clientset, services: services, extendedMetadata: providerExtendedMetadata}, nil
+}
+
+// Name returns the name of the provider
+func (p *Provider) Name() string {
+	return providerName
+}
+
+// ID returns the name of the provider id
+func (p *Provider) ID() string {
+	return p.id
+}
+
+// Services returns the provider services
+func (p *Provider) Services() []string {
+	return p.services.Keys()
+}
+
+// Resources returns the provider for an resource deployment source.
+func (p *Provider) Resources(ctx context.Context) (*schema.Resources, error) {
+	finalList := schema.NewResources()
+	services, err := p.clientSet.CoreV1().Services("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, errkit.Wrap(err, "could not list kubernetes services")
+	}
+	if p.services.Has("service") {
+		k8sServiceProvider := K8sServiceProvider{serviceClient: services, id: p.id}
+		serviceIPs, _ := k8sServiceProvider.GetResource(ctx)
+		finalList.Merge(serviceIPs)
+	}
+
+	if p.services.Has("ingress") {
+		ingress, err := p.clientSet.NetworkingV1().Ingresses("").List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, errkit.Wrap(err, "could not list kubernetes ingress")
+		}
+		k8sIngressProvider := K8sIngressProvider{ingress: ingress, id: p.id, extendedMetadata: p.extendedMetadata}
+		ingressHosts, _ := k8sIngressProvider.GetResource(ctx)
+		finalList.Merge(ingressHosts)
+	}
+	return finalList, nil
+}
+
+// buildConfigWithContext loads only kubeconfigPath when set. Without a path it
+// resolves like kubectl: $KUBECONFIG if set, otherwise ~/.kube/config,
+// otherwise the in-cluster service account.
+func buildConfigWithContext(context string, kubeconfigPath string) (*rest.Config, error) {
+	loadingRules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfigPath}
+	if kubeconfigPath == "" {
+		loadingRules = clientcmd.NewDefaultClientConfigLoadingRules()
+		// The legacy ~/.kube/.kubeconfig migration writes to the home directory.
+		loadingRules.MigrationRules = nil
+	}
+	kubeConfig, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		loadingRules,
+		&clientcmd.ConfigOverrides{
+			CurrentContext: context,
+		}).ClientConfig()
+	if kubeconfigPath == "" && clientcmd.IsEmptyConfig(err) {
+		return nil, errkit.New("no kubeconfig found in $KUBECONFIG, ~/.kube/config or the in-cluster service account")
+	}
+	if err != nil {
+		return nil, errkit.Wrap(err, "could not read kubeconfig file")
+	}
+	return kubeConfig, nil
+}
+
+func buildConfigFromStr(contextName string, config []byte) (*rest.Config, error) {
+
+	clientConfig, err := clientcmd.NewClientConfigFromBytes(config)
+	if err != nil {
+		return nil, errkit.Wrap(err, "could not read kubeconfig file")
+	}
+	rawConfig, err := clientConfig.RawConfig()
+	if err != nil {
+		return nil, errkit.Wrap(err, "could not read kubeconfig file")
+	}
+	if contextName != "" {
+		// Check if the context exists in the kubeconfig
+		if _, exists := rawConfig.Contexts[contextName]; !exists {
+			return nil, errkit.Newf("context %q does not exist in the kubeconfig", contextName)
+		}
+		rawConfig.CurrentContext = contextName
+	}
+
+	// Create a new clientcmd.ClientConfig from the modified rawConfig
+	modifiedClientConfig := clientcmd.NewNonInteractiveClientConfig(rawConfig, rawConfig.CurrentContext, &clientcmd.ConfigOverrides{}, nil)
+
+	// Get the rest.Config from the modified client configuration
+	kubeConfig, err := modifiedClientConfig.ClientConfig()
+	if err != nil {
+		return nil, fmt.Errorf("could not get client config: %v", err)
+	}
+	return kubeConfig, nil
+}

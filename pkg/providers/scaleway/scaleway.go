@@ -1,0 +1,100 @@
+package scaleway
+
+import (
+	"context"
+
+	"github.com/projectdiscovery/cloudlist/pkg/schema"
+	"github.com/projectdiscovery/gologger"
+	container "github.com/scaleway/scaleway-sdk-go/api/container/v1beta1"
+	"github.com/scaleway/scaleway-sdk-go/api/flexibleip/v1alpha1"
+	function "github.com/scaleway/scaleway-sdk-go/api/function/v1beta1"
+	"github.com/scaleway/scaleway-sdk-go/api/instance/v1"
+	k8s "github.com/scaleway/scaleway-sdk-go/api/k8s/v1"
+	"github.com/scaleway/scaleway-sdk-go/api/lb/v1"
+	"github.com/scaleway/scaleway-sdk-go/scw"
+)
+
+var Services = []string{"instance", "flexibleip", "lb", "container", "function", "kapsule"}
+
+// Provider is a data provider for scaleway API
+type Provider struct {
+	id       string
+	client   *scw.Client
+	services schema.ServiceMap
+}
+
+// New creates a new provider client for scaleway API
+func New(options schema.OptionBlock) (*Provider, error) {
+	accessKey, ok := options.GetMetadata(apiAccessKey)
+	if !ok {
+		return nil, &schema.ErrNoSuchKey{Name: apiAccessKey}
+	}
+	accessToken, ok := options.GetMetadata(apiAccessToken)
+	if !ok {
+		return nil, &schema.ErrNoSuchKey{Name: apiAccessToken}
+	}
+	id, _ := options.GetMetadata("id")
+	services := options.ResolveServices(Services)
+
+	client, err := scw.NewClient(scw.WithAuth(accessKey, accessToken))
+	if err != nil {
+		return nil, err
+	}
+	return &Provider{client: client, id: id, services: services}, nil
+}
+
+const providerName = "scw"
+
+// Name returns the name of the provider
+func (p *Provider) Name() string {
+	return providerName
+}
+
+// ID returns the name of the provider id
+func (p *Provider) ID() string {
+	return p.id
+}
+
+// Services returns the provider services
+func (p *Provider) Services() []string {
+	return p.services.Keys()
+}
+
+const apiAccessKey = "scaleway_access_key"
+const apiAccessToken = "scaleway_access_token"
+
+// Resources returns the provider for an resource deployment source.
+func (p *Provider) Resources(ctx context.Context) (*schema.Resources, error) {
+	finalResources := schema.NewResources()
+	if p.services.Has("instance") {
+		provider := &instanceProvider{instanceAPI: instance.NewAPI(p.client), id: p.id}
+		if resources, err := provider.GetResource(ctx); err == nil {
+			finalResources.Merge(resources)
+		}
+	}
+
+	ips := &ipProvider{id: p.id, instanceAPI: instance.NewAPI(p.client), flexibleIPAPI: flexibleip.NewAPI(p.client), lbAPI: lb.NewZonedAPI(p.client)}
+	containers := &containerProvider{id: p.id, containerAPI: container.NewAPI(p.client), functionAPI: function.NewAPI(p.client), k8sAPI: k8s.NewAPI(p.client)}
+	for _, s := range []struct {
+		name         string
+		getResources func(context.Context) (*schema.Resources, error)
+	}{
+		{"flexibleip", ips.GetFlexibleIPs},
+		{"lb", ips.GetLoadBalancerIPs},
+		{"container", containers.GetContainers},
+		{"function", containers.GetFunctions},
+		{"kapsule", containers.GetKapsuleClusters},
+	} {
+		if !p.services.Has(s.name) {
+			continue
+		}
+		resources, err := s.getResources(ctx)
+		if resources != nil {
+			finalResources.Merge(resources)
+		}
+		if err != nil {
+			gologger.Warning().Msgf("scaleway: %s listing failed: %v", s.name, err)
+		}
+	}
+	return finalResources, nil
+}

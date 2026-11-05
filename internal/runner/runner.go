@@ -1,0 +1,336 @@
+package runner
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+
+	jsoniter "github.com/json-iterator/go"
+	"github.com/projectdiscovery/cloudlist/pkg/schema"
+	"github.com/projectdiscovery/cloudlist/pkg/schema/validate"
+	"github.com/projectdiscovery/gologger"
+)
+
+// Runner is a client for running cloud provider asset enumeration
+type Runner struct {
+	config  schema.Options
+	options *Options
+}
+
+// New creates a new runner instance based on configuration options
+func New(options *Options) (*Runner, error) {
+
+	var config schema.Options
+	if options.AutoDiscovery {
+		config = autoDiscoveryConfig()
+	} else {
+		if options.ProviderConfig == "" {
+			options.ProviderConfig = defaultProviderConfigLocation
+			gologger.Print().Msgf("Using default provider config: %s\n", options.ProviderConfig)
+		}
+
+		var err error
+		config, err = readProviderConfig(options.ProviderConfig)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// CLI overrides config
+	if len(options.Services) == 0 {
+		options.Services = append(options.Services, config.GetServiceNames()...)
+	}
+	if len(options.ExcludeServices) == 0 {
+		options.ExcludeServices = append(options.ExcludeServices, config.GetExcludeServiceNames()...)
+	}
+
+	// assign default services if not provided
+	if len(options.Services) == 0 {
+		options.Services = append(options.Services, defaultServices...)
+	}
+	if len(options.Providers) == 0 {
+		options.Providers = append(options.Providers, defaultProviders...)
+	}
+
+	return &Runner{config: config, options: options}, nil
+}
+
+// Enumerate performs the cloudlist enumeration process
+func (r *Runner) Enumerate() {
+	finalConfig := schema.Options{}
+	services := []string{}
+	if r.options.Services != nil {
+		services = r.options.Services
+	}
+	excludeServices := []string{}
+	if r.options.ExcludeServices != nil {
+		excludeServices = r.options.ExcludeServices
+	}
+
+	for _, item := range r.config {
+		if item == nil {
+			continue
+		}
+		if _, ok := item["id"]; !ok {
+			item["id"] = ""
+		}
+		if len(services) > 0 {
+			item["services"] = strings.Join(services, ",")
+		}
+		if len(excludeServices) > 0 {
+			item["exclude_services"] = strings.Join(excludeServices, ",")
+		}
+		if r.options.ExtendedMetadata {
+			item["extended_metadata"] = "true"
+		}
+
+		// Validate and only pass the correct items to input
+		if len(r.options.Providers) != 0 || len(r.options.Id) != 0 {
+			if len(r.options.Providers) != 0 && !Contains(r.options.Providers, item["provider"]) {
+				continue
+			}
+			if len(r.options.Id) != 0 && !Contains(r.options.Id, item["id"]) {
+				continue
+			}
+			finalConfig = append(finalConfig, item)
+		} else {
+			finalConfig = append(finalConfig, item)
+		}
+	}
+
+	inventory, err := r.newInventory(finalConfig)
+	if err != nil {
+		gologger.Fatal().Msgf("Could not create inventory: %s\n", err)
+	}
+
+	var output *os.File
+	if r.options.Output != "" {
+		outputFile, err := os.Create(r.options.Output)
+		if err != nil {
+			gologger.Fatal().Msgf("Could not create output file %s: %s\n", r.options.Output, err)
+		}
+		output = outputFile
+	}
+
+	builder := &bytes.Buffer{}
+	deduplicator := schema.NewResourceDeduplicator()
+	for _, provider := range inventory.Providers {
+		gologger.Info().Msgf("Listing assets from provider: %s services: %s id: %s", provider.Name(), strings.Join(provider.Services(), ","), provider.ID())
+
+		instances, err := provider.Resources(context.Background())
+		if err != nil {
+			gologger.Warning().Msgf("Could not get resources for provider %s %s: %s\n", provider.Name(), provider.ID(), err)
+			continue
+		}
+		var hostsCount, ipCount int
+		for _, instance := range instances.Items {
+			// Skip if already processed
+			if !deduplicator.ProcessResource(instance) {
+				continue
+			}
+
+			sanitizePrivateIPs(instance, r.options.ExcludePrivate)
+
+			builder.Reset()
+
+			if r.options.JSON {
+				data, err := jsoniter.Marshal(instance)
+				if err != nil {
+					gologger.Verbose().Msgf("ERR: Could not marshal json: %s\n", err)
+				} else {
+					builder.Write(data)
+					builder.WriteString("\n")
+					writeOutputBytes(output, builder.Bytes())
+
+					if instance.DNSName != "" {
+						hostsCount++
+					}
+					if instance.PrivateIpv4 != "" {
+						ipCount++
+					}
+					if instance.PrivateIpv6 != "" {
+						ipCount++
+					}
+					if instance.PublicIPv4 != "" {
+						ipCount++
+					}
+					if instance.PublicIPv6 != "" {
+						ipCount++
+					}
+					gologger.Silent().Msgf("%s", builder.String())
+					builder.Reset()
+				}
+				continue
+			}
+
+			if r.options.Hosts {
+				if instance.DNSName != "" {
+					hostsCount++
+					builder.WriteString(instance.DNSName)
+					builder.WriteRune('\n')
+					writeOutputString(output, builder.String())
+					builder.Reset()
+					gologger.Silent().Msgf("%s", instance.DNSName)
+				}
+				continue
+			}
+			if r.options.IPAddress {
+				if instance.PublicIPv4 != "" {
+					ipCount++
+					builder.WriteString(instance.PublicIPv4)
+					builder.WriteRune('\n')
+					writeOutputString(output, builder.String())
+					builder.Reset()
+					gologger.Silent().Msgf("%s", instance.PublicIPv4)
+				}
+				if instance.PublicIPv6 != "" {
+					ipCount++
+					builder.WriteString(instance.PublicIPv6)
+					builder.WriteRune('\n')
+					writeOutputString(output, builder.String())
+					builder.Reset()
+					gologger.Silent().Msgf("%s", instance.PublicIPv6)
+				}
+				if instance.PrivateIpv4 != "" && !r.options.ExcludePrivate {
+					ipCount++
+					builder.WriteString(instance.PrivateIpv4)
+					builder.WriteRune('\n')
+					writeOutputString(output, builder.String())
+					builder.Reset()
+					gologger.Silent().Msgf("%s", instance.PrivateIpv4)
+				}
+				if instance.PrivateIpv6 != "" && !r.options.ExcludePrivate {
+					ipCount++
+					builder.WriteString(instance.PrivateIpv6)
+					builder.WriteRune('\n')
+					writeOutputString(output, builder.String())
+					builder.Reset()
+					gologger.Silent().Msgf("%s", instance.PrivateIpv6)
+				}
+				continue
+			}
+
+			if instance.DNSName != "" {
+				hostsCount++
+				builder.WriteString(instance.DNSName)
+				builder.WriteRune('\n')
+				writeOutputString(output, builder.String())
+				builder.Reset()
+				gologger.Silent().Msgf("%s", instance.DNSName)
+			}
+			if instance.PublicIPv4 != "" {
+				ipCount++
+				builder.WriteString(instance.PublicIPv4)
+				builder.WriteRune('\n')
+				writeOutputString(output, builder.String())
+				builder.Reset()
+				gologger.Silent().Msgf("%s", instance.PublicIPv4)
+			}
+			if instance.PublicIPv6 != "" {
+				ipCount++
+				builder.WriteString(instance.PublicIPv6)
+				builder.WriteRune('\n')
+				writeOutputString(output, builder.String())
+				builder.Reset()
+				gologger.Silent().Msgf("%s", instance.PublicIPv6)
+			}
+			if instance.PrivateIpv4 != "" && !r.options.ExcludePrivate {
+				ipCount++
+				builder.WriteString(instance.PrivateIpv4)
+				builder.WriteRune('\n')
+				writeOutputString(output, builder.String())
+				builder.Reset()
+				gologger.Silent().Msgf("%s", instance.PrivateIpv4)
+			}
+			if instance.PrivateIpv6 != "" && !r.options.ExcludePrivate {
+				ipCount++
+				builder.WriteString(instance.PrivateIpv6)
+				builder.WriteRune('\n')
+				writeOutputString(output, builder.String())
+				builder.Reset()
+				gologger.Silent().Msgf("%s", instance.PrivateIpv6)
+			}
+		}
+		logBuilder := &strings.Builder{}
+		if hostsCount != 0 {
+			logBuilder.WriteString(strconv.Itoa(hostsCount))
+			logBuilder.WriteString(" Hosts")
+		}
+		if ipCount != 0 {
+			if hostsCount != 0 {
+				logBuilder.WriteString(" and ")
+			}
+			logBuilder.WriteString(strconv.Itoa(ipCount))
+			logBuilder.WriteString(" IP Addresses")
+		}
+		if hostsCount == 0 && ipCount == 0 {
+			gologger.Warning().Msgf("No results found for %s (%s)\n", provider.Name(), provider.ID())
+		} else {
+			gologger.Info().Msgf("Found %s for %s (%s)\n", logBuilder.String(), provider.Name(), provider.ID())
+		}
+	}
+}
+
+func Contains(s []string, e string) bool {
+	for _, a := range s {
+		if strings.EqualFold(a, e) {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizePrivateIPs(resource *schema.Resource, exclude bool) {
+	if !exclude || resource == nil {
+		return
+	}
+	resource.PrivateIpv4 = ""
+	resource.PrivateIpv6 = ""
+
+	if isPrivateIP(resource.PublicIPv4) {
+		resource.PublicIPv4 = ""
+	}
+	if isPrivateIP(resource.PublicIPv6) {
+		resource.PublicIPv6 = ""
+	}
+}
+
+var (
+	ipValidatorOnce sync.Once
+	ipValidator     *validate.Validator
+)
+
+func isPrivateIP(ip string) bool {
+	if ip == "" {
+		return false
+	}
+	ipValidatorOnce.Do(func() {
+		var err error
+		ipValidator, err = validate.NewValidator()
+		if err != nil {
+			gologger.Warning().Msgf("could not initialize ip validator: %s", err)
+		}
+	})
+	if ipValidator == nil {
+		return false
+	}
+	resourceType := ipValidator.Identify(ip)
+	return resourceType == validate.PrivateIPv4 || resourceType == validate.PrivateIPv6
+}
+
+func writeOutputString(output *os.File, data string) {
+	if output == nil || data == "" {
+		return
+	}
+	_, _ = output.WriteString(data)
+}
+
+func writeOutputBytes(output *os.File, data []byte) {
+	if output == nil || len(data) == 0 {
+		return
+	}
+	_, _ = output.Write(data)
+}
