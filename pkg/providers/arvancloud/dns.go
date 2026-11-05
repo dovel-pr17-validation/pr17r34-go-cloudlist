@@ -23,13 +23,13 @@ func (d *dnsProvider) name() string {
 func (d *dnsProvider) GetResource(ctx context.Context) (*schema.Resources, error) {
 	list := schema.NewResources()
 
-	domains, _, err := d.client.DomainApi.DomainsIndex(ctx).Execute()
+	domains, _, err := d.client.DomainAPI.DomainsIndex(ctx).Execute()
 	if err != nil {
 		return nil, errors.Wrap(err, "could not get domains")
 	}
 
 	for _, domain := range domains.GetData() {
-		dnsRecords, _, err := d.client.DNSManagementApi.DnsRecordsIndex(ctx, domain.GetId()).Execute()
+		dnsRecords, _, err := d.client.DNSManagementAPI.DnsRecordsIndex(ctx, domain.GetId()).Execute()
 		if err != nil {
 			return nil, errors.Wrap(err, fmt.Sprintf("could not get dns records for domain `%s`", domain.GetName()))
 		}
